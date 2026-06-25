@@ -14,7 +14,7 @@ The current server is shaped like a deployable service rather than a stdio-only 
 - Request IDs via `x-request-id`.
 - Graceful shutdown on `SIGINT` and `SIGTERM`.
 
-JWT verification is handled with `jose` against a configured OIDC issuer, audience, and JWKS URI. Tenant policy storage uses PostgreSQL, and rate limiting uses Upstash Redis. FGA tuples and MCP session state are still process-local and should be replaced or handled with deployment-level session affinity before using this for real authorization decisions.
+JWT verification is handled with `jose` against a configured OIDC issuer, audience, and JWKS URI. Tenant policy storage uses PostgreSQL, and rate limiting uses Upstash Redis. MCP session state is still process-local and should be handled with deployment-level session affinity before using this for real control-plane operations.
 
 ## Requirements
 
@@ -68,6 +68,16 @@ RATE_LIMIT_MAX_REQUESTS=50
 ```
 
 `OIDC_ISSUER`, `OIDC_AUDIENCE`, `OIDC_JWKS_URI`, `DATABASE_URL`, `UPSTASH_REDIS_REST_URL`, and `UPSTASH_REDIS_REST_TOKEN` are required. The process fails during startup if any of them are missing.
+
+For Auth0, these OIDC values must match the access token exactly:
+
+```bash
+OIDC_ISSUER=https://YOUR_AUTH0_DOMAIN/
+OIDC_AUDIENCE=http://localhost:3000
+OIDC_JWKS_URI=https://YOUR_AUTH0_DOMAIN/.well-known/jwks.json
+```
+
+If `OIDC_JWKS_URI` is still set to the placeholder issuer, token verification fails with `Execution Exception: fetch failed` because the server cannot fetch the signing keys. If the JWT is valid but does not include `policy:write`, the tool returns `Forbidden: Token missing required macro-scope 'policy:write'.`
 
 ## Database Setup
 
@@ -127,6 +137,70 @@ In production, put the service behind your normal ingress, TLS termination, auth
 
 `SESSION_STATE_MODE=sticky` documents the current process-local MCP session map. Multiple replicas require load-balancer session affinity for `/mcp`. Use `SESSION_STATE_MODE=external` only after implementing shared MCP session coordination.
 
+## Curl Examples
+
+Start the local server:
+
+```bash
+npm run dev
+```
+
+Check that the HTTP server is up:
+
+```bash
+curl -i http://localhost:3000/healthz
+```
+
+Initialize an MCP session:
+
+```bash
+curl -i http://localhost:3000/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+      "protocolVersion": "2025-06-18",
+      "capabilities": {},
+      "clientInfo": {
+        "name": "curl",
+        "version": "1.0.0"
+      }
+    }
+  }'
+```
+
+Copy the `mcp-session-id` response header. MCP sessions are process-local, so restarting the server invalidates previous session IDs.
+
+Call the tenant policy tool. This is also the token-validation path: the server validates the JWT signature, issuer, audience, expiry, and required scopes before writing policy changes.
+
+```bash
+curl -i http://localhost:3000/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'mcp-session-id: YOUR_SESSION_ID' \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/call",
+    "params": {
+      "name": "patch_tenant_security_policy",
+      "arguments": {
+        "accessToken": "YOUR_REAL_JWT",
+        "targetTenant": "tenant:company_alpha",
+        "policyUpdate": {
+          "botDetectionEnabled": true,
+          "suspiciousIpThrottling": true
+        }
+      }
+    }
+  }'
+```
+
+The JWT must be issued by `OIDC_ISSUER`, intended for `OIDC_AUDIENCE`, signed by a key published at `OIDC_JWKS_URI`, and carry `policy:write` in `scope`, `scopes`, or `scp`. If the token contains a `tenant_id` claim, it must match the requested tenant, for example `company_alpha` for `tenant:company_alpha`.
+
 ## Tool: `patch_tenant_security_policy`
 
 Updates selected security policy settings for a target tenant after authentication and authorization checks.
@@ -135,7 +209,7 @@ Updates selected security policy settings for a target tenant after authenticati
 
 ```json
 {
-  "accessToken": "eyJ.real-jwt-access-token",
+  "accessToken": "YOUR_REAL_JWT",
   "targetTenant": "tenant:company_alpha",
   "policyUpdate": {
     "botDetectionEnabled": true,
@@ -148,12 +222,11 @@ Updates selected security policy settings for a target tenant after authenticati
 
 1. `SecurityEngine.verifyAuth0Token` verifies the JWT signature through the configured JWKS URI.
 2. `jose` validates issuer, audience, expiry, and standard JWT validity constraints.
-3. Scopes are extracted from either `scope` or `scp`.
+3. Scopes are extracted from `scope`, `scopes`, or `scp`.
 4. `SecurityEngine.enforceRateLimit` applies a Redis-backed per-subject rate limit.
 5. The handler requires the decoded token to include `policy:write`.
 6. If the token contains `tenant_id`, it must match `targetTenant`.
-7. `SecurityEngine.checkFga` requires the verified subject to have the `editor` relation on the target tenant.
-8. The PostgreSQL tenant policy row is updated and an audit event is written in the same transaction.
+7. The PostgreSQL tenant policy row is updated and an audit event is written in the same transaction.
 
 ### Successful Response
 
@@ -176,8 +249,8 @@ src/
   config.ts                    Central environment validation
   index.ts                    Express HTTP MCP server entry point
   logger.ts                   Shared Pino logger
-  core/types.ts               Shared identity, FGA, and policy types
-  middleware/security.ts      JWT verification, mock FGA, and rate-limit enforcement
+  core/types.ts               Shared identity and policy types
+  middleware/security.ts      JWT verification and rate-limit enforcement
   repositories/               PostgreSQL policy storage and Redis rate limiting
   scripts/migrate.ts          SQL migration runner
   tools/identityTools.ts      MCP tool registration and handler logic
@@ -193,12 +266,17 @@ The migration seeds:
 
 - Tenant: `tenant:company_alpha`
 
-The FGA layer currently includes process-local tuples:
+The access token must be a JWT issued by `OIDC_ISSUER`, intended for `OIDC_AUDIENCE`, signed by a key published at `OIDC_JWKS_URI`, and carrying `policy:write` in `scope`, `scopes`, or `scp`.
 
-- Authorized editor relation: `agent:auto-pilot` on `tenant:company_alpha`
-- Authorized owner relation: `user:security-lead` on `tenant:company_alpha`
+## Public Repository Safety
 
-The access token must be a JWT issued by `OIDC_ISSUER`, intended for `OIDC_AUDIENCE`, signed by a key published at `OIDC_JWKS_URI`, and carrying `policy:write` in either `scope` or `scp`.
+Before pushing this project to a public repository:
+
+- Do not commit `.env`; it is ignored by `.gitignore`.
+- Keep `.env.example` placeholder-only.
+- Do not paste real JWTs, database URLs, Redis tokens, Auth0 client secrets, or private JWKS material into README files, examples, tests, or commit messages.
+- Rotate any token that was pasted into a terminal, issue tracker, chat, or public branch.
+- Run `git status --short` and inspect new files before pushing.
 
 ## Production Hardening Checklist
 
@@ -209,7 +287,6 @@ Before using this pattern for real control-plane operations:
 - Put the HTTP service behind TLS and ingress-level authentication controls.
 - Add CORS and host/origin validation appropriate for your deployment.
 - Use sticky sessions or an architecture that preserves MCP session affinity across replicas.
-- Replace mock FGA tuples with OpenFGA or another durable authorization system.
 - Add managed database backups, migration automation, and connection pool sizing for your deployment.
 - Decide whether MCP session state should remain sticky-session based or move to shared coordination.
 - Add metrics and tracing.

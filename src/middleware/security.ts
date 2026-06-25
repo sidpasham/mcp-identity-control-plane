@@ -1,17 +1,11 @@
 import { createRemoteJWKSet, jwtVerify } from "jose";
-import { TokenPayload, FgaTuple } from "../core/types.js";
+import { TokenPayload } from "../core/types.js";
 import { UpstashRateLimiter } from "../repositories/rateLimiter.js";
 import { config } from "../config.js";
 import { extractScopes, extractTenantId } from "../auth/claims.js";
 
 const jwks = createRemoteJWKSet(new URL(config.oidcJwksUri));
 const rateLimiter = new UpstashRateLimiter();
-
-// Mock database for OpenFGA relations
-const mockFgaStore: FgaTuple[] = [
-  { user: "agent:auto-pilot", relation: "editor", object: "tenant:company_alpha" },
-  { user: "user:security-lead", relation: "owner", object: "tenant:company_alpha" }
-];
 
 export class SecurityEngine {
   /**
@@ -38,18 +32,9 @@ export class SecurityEngine {
       sub: payload.sub,
       iss: String(payload.iss),
       aud: payload.aud,
-      scp: scopes,
+      scopes: scopes,
       tenant_id: tenantId
     };
-  }
-
-  /**
-   * Implements Fine-Grained Authorization (FGA) checking the tuple relation
-   */
-  static checkFga(user: string, relation: string, object: string): boolean {
-    return mockFgaStore.some(
-      (tuple) => tuple.user === user && tuple.relation === relation && tuple.object === object
-    );
   }
 
   /**

@@ -6,6 +6,11 @@ export function extractScopes(payload: JWTPayload): string[] {
     return scope.split(" ").filter(Boolean);
   }
 
+  const scopes = payload.scopes;
+  if (Array.isArray(scopes) && scopes.every((value) => typeof value === "string")) {
+    return scopes;
+  }
+
   const scp = payload.scp;
   if (Array.isArray(scp) && scp.every((value) => typeof value === "string")) {
     return scp;
