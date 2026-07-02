@@ -59,6 +59,8 @@ SESSION_STATE_MODE=sticky
 OIDC_ISSUER=https://issuer.example.com/
 OIDC_AUDIENCE=https://identity-control-plane.example
 OIDC_JWKS_URI=https://issuer.example.com/.well-known/jwks.json
+MCP_RESOURCE_SERVER_URL=http://localhost:3000/mcp
+MCP_ACCESS_SCOPES=mcp:readonly,mcp:readwrite
 DATABASE_URL=postgresql://user:password@host/dbname?sslmode=verify-full
 PG_POOL_MAX=10
 UPSTASH_REDIS_REST_URL=https://example.upstash.io
@@ -77,7 +79,68 @@ OIDC_AUDIENCE=http://localhost:3000
 OIDC_JWKS_URI=https://YOUR_AUTH0_DOMAIN/.well-known/jwks.json
 ```
 
-If `OIDC_JWKS_URI` is still set to the placeholder issuer, token verification fails with `Execution Exception: fetch failed` because the server cannot fetch the signing keys. If the JWT is valid but does not include `policy:write`, the tool returns `Forbidden: Token missing required macro-scope 'policy:write'.`
+If `OIDC_JWKS_URI` is still set to the placeholder issuer, token verification fails because the server cannot fetch the signing keys. `/mcp` requires a bearer token with one of the configured `MCP_ACCESS_SCOPES`. Write tools also require `mcp:readwrite` plus the tool-specific business scope, such as `policy:write`. In production, set `MCP_RESOURCE_SERVER_URL` to the externally reachable HTTPS URL for the MCP endpoint.
+
+## Scope Model
+
+The service separates MCP transport access from business authorization:
+
+```text
+mcp:readonly   Access /mcp and call read-only MCP tools
+mcp:readwrite  Access /mcp and call read/write MCP tools
+policy:read    Business permission to read tenant policy
+policy:write   Business permission to mutate tenant policy
+tenant_id      Trusted resource boundary claim
+```
+
+`/mcp` accepts either `mcp:readonly` or `mcp:readwrite`. Individual tools apply stricter policies. For example, `patch_tenant_security_policy` requires `mcp:readwrite`, `policy:write`, and a matching `tenant_id` claim when the token includes one.
+
+## MCP Authorization
+
+This service follows the MCP HTTP authorization model from the MCP authorization specification. The MCP server acts as an OAuth resource server: it does not issue tokens, but it validates bearer access tokens issued by the configured OIDC authorization server.
+
+Clients authenticate every MCP HTTP request with:
+
+```http
+Authorization: Bearer <access-token>
+```
+
+The server exposes OAuth Protected Resource Metadata so MCP clients can discover the authorization server and supported scopes:
+
+```text
+/.well-known/oauth-protected-resource
+/.well-known/oauth-protected-resource/mcp
+```
+
+The metadata advertises:
+
+- `resource`: the canonical MCP resource URL from `MCP_RESOURCE_SERVER_URL`
+- `authorization_servers`: the configured `OIDC_ISSUER`
+- `scopes_supported`: `mcp:readonly`, `mcp:readwrite`, `policy:read`, `policy:write`
+- `bearer_methods_supported`: `header`
+
+Unauthenticated or invalid `/mcp` requests receive a bearer challenge. Insufficient-scope responses include a `WWW-Authenticate` header with `error="insufficient_scope"`, a `scope` hint, and `resource_metadata` pointing to the protected resource metadata document.
+
+Authorization is layered:
+
+```text
+HTTP /mcp layer:
+  JWT issuer/audience/signature/expiry validation
+  mcp:readonly OR mcp:readwrite
+
+Tool layer:
+  operation-specific MCP scope
+  operation-specific business scope
+
+Tenant/resource layer:
+  tenant_id claim must match the requested tenant when present
+```
+
+For the current write tool, the effective requirement is:
+
+```text
+mcp:readwrite AND policy:write AND matching tenant_id boundary
+```
 
 ## Database Setup
 
@@ -119,11 +182,13 @@ Default endpoints:
 
 ```text
 GET|POST|DELETE /mcp      MCP Streamable HTTP transport endpoint
+GET             /.well-known/oauth-protected-resource
+GET             /.well-known/oauth-protected-resource/mcp
 GET             /healthz  health check endpoint
 GET             /readyz   PostgreSQL and Redis readiness checks
 ```
 
-The server listens on `http://0.0.0.0:3000` by default. MCP clients should connect to the externally reachable service URL for the `/mcp` endpoint.
+The server listens on `http://0.0.0.0:3000` by default. MCP clients should connect to the externally reachable service URL for the `/mcp` endpoint. Protected resource metadata advertises the canonical MCP resource URL, authorization server issuer, and supported scopes.
 
 ## MCP Client Configuration
 
@@ -155,6 +220,7 @@ Initialize an MCP session:
 
 ```bash
 curl -i http://localhost:3000/mcp \
+  -H 'Authorization: Bearer YOUR_REAL_JWT' \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   -d '{
@@ -174,10 +240,11 @@ curl -i http://localhost:3000/mcp \
 
 Copy the `mcp-session-id` response header. MCP sessions are process-local, so restarting the server invalidates previous session IDs.
 
-Call the tenant policy tool. This is also the token-validation path: the server validates the JWT signature, issuer, audience, expiry, and required scopes before writing policy changes.
+Call the tenant policy tool. The same bearer token authorizes the MCP HTTP request and supplies the identity used for tool-level authorization.
 
 ```bash
 curl -i http://localhost:3000/mcp \
+  -H 'Authorization: Bearer YOUR_REAL_JWT' \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   -H 'mcp-session-id: YOUR_SESSION_ID' \
@@ -188,9 +255,8 @@ curl -i http://localhost:3000/mcp \
     "params": {
       "name": "patch_tenant_security_policy",
       "arguments": {
-        "accessToken": "YOUR_REAL_JWT",
         "targetTenant": "tenant:company_alpha",
-        "policyUpdate": {
+        "settings": {
           "botDetectionEnabled": true,
           "suspiciousIpThrottling": true
         }
@@ -199,7 +265,7 @@ curl -i http://localhost:3000/mcp \
   }'
 ```
 
-The JWT must be issued by `OIDC_ISSUER`, intended for `OIDC_AUDIENCE`, signed by a key published at `OIDC_JWKS_URI`, and carry `policy:write` in `scope`, `scopes`, or `scp`. If the token contains a `tenant_id` claim, it must match the requested tenant, for example `company_alpha` for `tenant:company_alpha`.
+The JWT must be issued by `OIDC_ISSUER`, intended for `OIDC_AUDIENCE`, signed by a key published at `OIDC_JWKS_URI`, and carry `mcp:readwrite` plus `policy:write` in `scope`, `scopes`, or `scp` to call this write tool. If the token contains a `tenant_id` claim, it must match the requested tenant, for example `company_alpha` for `tenant:company_alpha`.
 
 ## Tool: `patch_tenant_security_policy`
 
@@ -209,9 +275,8 @@ Updates selected security policy settings for a target tenant after authenticati
 
 ```json
 {
-  "accessToken": "YOUR_REAL_JWT",
   "targetTenant": "tenant:company_alpha",
-  "policyUpdate": {
+  "settings": {
     "botDetectionEnabled": true,
     "suspiciousIpThrottling": true
   }
@@ -220,13 +285,16 @@ Updates selected security policy settings for a target tenant after authenticati
 
 ### Authorization Flow
 
-1. `SecurityEngine.verifyAuth0Token` verifies the JWT signature through the configured JWKS URI.
-2. `jose` validates issuer, audience, expiry, and standard JWT validity constraints.
-3. Scopes are extracted from `scope`, `scopes`, or `scp`.
-4. `SecurityEngine.enforceRateLimit` applies a Redis-backed per-subject rate limit.
-5. The handler requires the decoded token to include `policy:write`.
-6. If the token contains `tenant_id`, it must match `targetTenant`.
-7. The PostgreSQL tenant policy row is updated and an audit event is written in the same transaction.
+1. MCP clients discover protected resource metadata from `/.well-known/oauth-protected-resource/mcp` or the `resource_metadata` value in `WWW-Authenticate`.
+2. The client sends `Authorization: Bearer <access-token>` on every `/mcp` HTTP request.
+3. The MCP HTTP middleware verifies the bearer JWT signature through the configured JWKS URI.
+4. `jose` validates issuer, audience, expiry, and standard JWT validity constraints.
+5. Scopes are extracted from `scope`, `scopes`, or `scp`.
+6. `/mcp` requires one configured MCP access scope, such as `mcp:readonly` or `mcp:readwrite`.
+7. `SecurityEngine.enforceRateLimit` applies a Redis-backed per-subject rate limit.
+8. The write tool authorization policy requires `mcp:readwrite` and `policy:write`.
+9. If the token contains `tenant_id`, it must match `targetTenant`.
+10. The PostgreSQL tenant policy row is updated and an audit event is written in the same transaction.
 
 ### Successful Response
 
@@ -245,15 +313,36 @@ Updates selected security policy settings for a target tenant after authenticati
 
 ```text
 src/
-  auth/                        JWT claim parsing helpers
-  config.ts                    Central environment validation
-  index.ts                    Express HTTP MCP server entry point
-  logger.ts                   Shared Pino logger
-  core/types.ts               Shared identity and policy types
-  middleware/security.ts      JWT verification and rate-limit enforcement
-  repositories/               PostgreSQL policy storage and Redis rate limiting
-  scripts/migrate.ts          SQL migration runner
-  tools/identityTools.ts      MCP tool registration and handler logic
+  index.ts                     Express HTTP MCP server entry point
+  auth/
+    authorization.ts           Reusable tool authorization policies
+    claims.ts                  JWT claim extraction helpers
+    mcpAccess.ts               MCP HTTP bearer auth and access-scope checks
+    protectedResourceMetadata.ts
+                                OAuth protected resource metadata endpoints
+    scopes.ts                  Shared MCP and business scope constants
+    security.ts                JWT verification and rate-limit enforcement
+  config/
+    config.ts                  Central environment validation
+  database/
+    migrate.ts                 SQL migration runner
+  logging/
+    logger.ts                  Shared Pino logger
+  repositories/
+    rateLimiter.ts             Redis-backed actor rate limiting
+    tenantPolicyRepository.ts  PostgreSQL policy storage and audit writes
+  tools/
+    toolResult.ts              Shared MCP tool response helpers
+    identity/
+      index.ts                 Identity tool registry
+      dependencies.ts          Identity tool dependency resolution
+      patchTenantSecurityPolicy.ts
+                               Tenant security policy patch tool
+  types/
+    types.ts                   Shared identity and policy types
+tests/
+  auth/
+  repositories/
 migrations/
   001_tenant_policy_storage.sql
 Dockerfile
@@ -266,7 +355,7 @@ The migration seeds:
 
 - Tenant: `tenant:company_alpha`
 
-The access token must be a JWT issued by `OIDC_ISSUER`, intended for `OIDC_AUDIENCE`, signed by a key published at `OIDC_JWKS_URI`, and carrying `policy:write` in `scope`, `scopes`, or `scp`.
+The access token must be a JWT issued by `OIDC_ISSUER`, intended for `OIDC_AUDIENCE`, signed by a key published at `OIDC_JWKS_URI`, and carrying `mcp:readwrite` plus `policy:write` in `scope`, `scopes`, or `scp` for write tools.
 
 ## Public Repository Safety
 

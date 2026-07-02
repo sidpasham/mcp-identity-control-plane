@@ -1,11 +1,11 @@
 import pg from "pg";
-import { SecurityPolicy } from "../core/types.js";
-import { config } from "../config.js";
+import { SecurityPolicy } from "../types/types.js";
+import { config } from "../config/config.js";
 
 const { Pool } = pg;
 
 export interface TenantPolicyRepository {
-  patchPolicy(tenantId: string, policyUpdate: Partial<SecurityPolicy>, actorSub: string): Promise<SecurityPolicy>;
+  patchPolicy(tenantId: string, settings: Partial<SecurityPolicy>, actorSub: string): Promise<SecurityPolicy>;
 }
 
 export class PostgresTenantPolicyRepository implements TenantPolicyRepository {
@@ -25,7 +25,7 @@ export class PostgresTenantPolicyRepository implements TenantPolicyRepository {
     await this.pool.query("SELECT 1");
   }
 
-  async patchPolicy(tenantId: string, policyUpdate: Partial<SecurityPolicy>, actorSub: string): Promise<SecurityPolicy> {
+  async patchPolicy(tenantId: string, settings: Partial<SecurityPolicy>, actorSub: string): Promise<SecurityPolicy> {
     const client = await this.pool.connect();
 
     try {
@@ -47,7 +47,7 @@ export class PostgresTenantPolicyRepository implements TenantPolicyRepository {
 
       const nextPolicy = {
         ...currentPolicy,
-        ...policyUpdate
+        ...settings
       };
 
       const saved = await client.query<PolicyRow>(

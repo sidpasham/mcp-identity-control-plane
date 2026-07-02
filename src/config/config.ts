@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { defaultMcpAccessScopes } from "../auth/scopes.js";
 
 export type SessionStateMode = "sticky" | "external";
 
@@ -10,6 +11,8 @@ export interface AppConfig {
   oidcIssuer: string;
   oidcAudience: string;
   oidcJwksUri: string;
+  mcpResourceServerUrl: URL;
+  mcpAccessScopes: string[];
   databaseUrl: string;
   pgPoolMax: number;
   pgIdleTimeoutMs: number;
@@ -23,14 +26,18 @@ export interface AppConfig {
   sessionStateMode: SessionStateMode;
 }
 
+const port = numberEnv("PORT", 3000);
+
 export const config: AppConfig = {
   serviceName: "mcp-identity-control-plane",
-  port: numberEnv("PORT", 3000),
+  port,
   host: process.env.HOST ?? "0.0.0.0",
   logLevel: process.env.LOG_LEVEL ?? "info",
   oidcIssuer: requiredEnv("OIDC_ISSUER"),
   oidcAudience: requiredEnv("OIDC_AUDIENCE"),
   oidcJwksUri: requiredEnv("OIDC_JWKS_URI"),
+  mcpResourceServerUrl: urlEnv("MCP_RESOURCE_SERVER_URL", `http://localhost:${port}/mcp`),
+  mcpAccessScopes: stringListEnv("MCP_ACCESS_SCOPES", [...defaultMcpAccessScopes]),
   databaseUrl: requiredEnv("DATABASE_URL"),
   pgPoolMax: numberEnv("PG_POOL_MAX", 10),
   pgIdleTimeoutMs: numberEnv("PG_IDLE_TIMEOUT_MS", 30000),
@@ -64,6 +71,30 @@ function numberEnv(name: string, fallback: number): number {
   }
 
   return parsed;
+}
+
+function stringListEnv(name: string, fallback: string[]): string[] {
+  const value = process.env[name];
+  const values = value
+    ? value.split(/[,\s]+/).map((item) => item.trim()).filter(Boolean)
+    : fallback;
+
+  if (values.length === 0) {
+    throw new Error(`Environment variable ${name} must contain at least one value.`);
+  }
+
+  return values;
+}
+
+function urlEnv(name: string, fallback: string): URL {
+  const value = process.env[name] ?? fallback;
+  const url = new URL(value);
+
+  if (url.hash) {
+    throw new Error(`Environment variable ${name} must not include a URL fragment.`);
+  }
+
+  return url;
 }
 
 function sessionStateModeEnv(name: string, fallback: SessionStateMode): SessionStateMode {

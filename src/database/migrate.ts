@@ -1,8 +1,8 @@
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import pg from "pg";
-import { config } from "../config.js";
-import { logger } from "../logger.js";
+import { config } from "../config/config.js";
+import { logger } from "../logging/logger.js";
 
 const { Client } = pg;
 

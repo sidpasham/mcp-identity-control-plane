@@ -3,12 +3,14 @@ import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { config } from "./config.js";
-import { logger } from "./logger.js";
-import { SecurityEngine } from "./middleware/security.js";
+import { config } from "./config/config.js";
+import { logger } from "./logging/logger.js";
+import { requireAnyMcpAccessScope, requireMcpBearerAuth } from "./auth/mcpAccess.js";
+import { mcpProtectedResourceMetadataRouter } from "./auth/protectedResourceMetadata.js";
+import { SecurityEngine } from "./auth/security.js";
 import { PostgresTenantPolicyRepository } from "./repositories/tenantPolicyRepository.js";
 
-const { registerIdentityTools } = await import("./tools/identityTools.js");
+const { registerIdentityTools } = await import("./tools/identity/index.js");
 
 const transports = new Map<string, StreamableHTTPServerTransport>();
 const tenantPolicyRepository = new PostgresTenantPolicyRepository();
@@ -23,6 +25,8 @@ app.use((req, res, next) => {
   res.locals.requestId = requestId;
   next();
 });
+
+app.use(mcpProtectedResourceMetadataRouter());
 
 app.get("/healthz", (_req, res) => {
   res.status(200).json({ status: "ok", service: config.serviceName });
@@ -55,6 +59,8 @@ app.get("/readyz", async (_req, res) => {
     checks
   });
 });
+
+app.use("/mcp", requireMcpBearerAuth, requireAnyMcpAccessScope());
 
 app.get("/mcp", async (req, res) => {
   const transport = findExistingTransport(req, res);

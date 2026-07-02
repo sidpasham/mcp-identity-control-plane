@@ -1,5 +1,5 @@
 import { Redis } from "@upstash/redis";
-import { config } from "../config.js";
+import { config } from "../config/config.js";
 
 export interface RateLimiter {
   enforce(actorId: string): Promise<void>;
