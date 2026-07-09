@@ -64,10 +64,6 @@ export function requireTenantClaimMatchesTargetTenant(): AuthorizationPolicy {
   };
 }
 
-function deny(reason: string): AuthorizationDecision {
-  return { allowed: false, reason };
-}
-
 function formatMissingScopeReason(missingScopes: readonly string[]): string {
   if (missingScopes.length === 1) {
     return `Forbidden: Token missing required macro-scope '${missingScopes[0]}'.`;
@@ -78,4 +74,8 @@ function formatMissingScopeReason(missingScopes: readonly string[]): string {
 
 function formatScopeList(scopes: readonly string[]): string {
   return scopes.map((scope) => `'${scope}'`).join(", ");
+}
+
+function deny(reason: string): AuthorizationDecision {
+  return { allowed: false, reason };
 }

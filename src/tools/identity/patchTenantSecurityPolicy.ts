@@ -8,24 +8,32 @@ import {
   type AuthorizationDecision
 } from "../../auth/authorization.js";
 import { McpScopes, PolicyScopes } from "../../auth/scopes.js";
-import { SecurityEngine } from "../../auth/security.js";
 import { logger } from "../../logging/logger.js";
+import type { RateLimiter } from "../../repositories/rateLimiter.js";
 import type { TenantPolicyRepository } from "../../repositories/tenantPolicyRepository.js";
 import type { TokenPayload } from "../../types/types.js";
 import { getErrorMessage, jsonToolResult, toolError, type TextToolResult } from "../toolResult.js";
 import type { IdentityToolDependencies } from "./dependencies.js";
 
 const TOOL_NAME = "patch_tenant_security_policy";
-const TOOL_DESCRIPTION =
-  "Enables or modifies critical perimeter guards (bot protection, throttling) for a specific Auth0 tenant domain.";
+const TOOL_DESCRIPTION = "Enables or modifies critical perimeter guards (bot protection, throttling) for a specific Auth0 tenant domain.";
 
 const securitySettingsSchema = z.object({
   botDetectionEnabled: z.boolean(),
   suspiciousIpThrottling: z.boolean()
 }).strict();
 
+const targetTenantSchema = z.string()
+  .trim()
+  .min(1)
+  .max(160)
+  .regex(
+    /^tenant:[A-Za-z0-9][A-Za-z0-9_.-]*$/,
+    "targetTenant must use tenant:<id> with alphanumeric, underscore, hyphen, or dot characters."
+  );
+
 const inputSchema = z.object({
-  targetTenant: z.string().trim().min(1).describe("The target tenant identifier (e.g., 'tenant:company_alpha')."),
+  targetTenant: targetTenantSchema.describe("The target tenant identifier (e.g., 'tenant:company_alpha')."),
   settings: securitySettingsSchema.describe("The targeted operational security settings configuration profile.")
 }).strict();
 
@@ -46,11 +54,11 @@ export function registerPatchTenantSecurityPolicyTool(
       description: TOOL_DESCRIPTION,
       inputSchema
     },
-    createPatchTenantSecurityPolicyHandler(dependencies.tenantPolicyRepository)
+    createPatchTenantSecurityPolicyHandler(dependencies.tenantPolicyRepository, dependencies.rateLimiter)
   );
 }
 
-function createPatchTenantSecurityPolicyHandler(tenantPolicyRepository: TenantPolicyRepository) {
+function createPatchTenantSecurityPolicyHandler(tenantPolicyRepository: TenantPolicyRepository, rateLimiter: RateLimiter) {
   return async (
     { targetTenant, settings }: PatchTenantSecurityPolicyInput,
     extra: { authInfo?: AuthInfo }
@@ -65,8 +73,6 @@ function createPatchTenantSecurityPolicyHandler(tenantPolicyRepository: TenantPo
 
       actorSub = identity.sub;
 
-      await SecurityEngine.enforceRateLimit(identity.sub);
-
       const authorization = authorizePatchTenantSecurityPolicy(identity, targetTenant);
       if (!authorization.allowed) {
         logger.warn(
@@ -75,6 +81,8 @@ function createPatchTenantSecurityPolicyHandler(tenantPolicyRepository: TenantPo
         );
         return toolError(authorization.reason);
       }
+
+      await rateLimiter.enforce(identity.sub);
 
       const currentConfig = await tenantPolicyRepository.patchPolicy(targetTenant, settings, identity.sub);
       logger.info({ actorSub: identity.sub, targetTenant }, "Tenant security policy updated");

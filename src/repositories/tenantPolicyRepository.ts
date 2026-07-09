@@ -1,32 +1,54 @@
 import pg from "pg";
 import { SecurityPolicy } from "../types/types.js";
 import { config } from "../config/config.js";
+import { retryDependency } from "../reliability/dependencies.js";
 
 const { Pool } = pg;
 
 export interface TenantPolicyRepository {
+  ping(): Promise<void>;
   patchPolicy(tenantId: string, settings: Partial<SecurityPolicy>, actorSub: string): Promise<SecurityPolicy>;
+}
+
+export interface PostgresTenantPolicyRepositoryOptions {
+  retryAttempts?: number;
+  retryDelayMs?: number;
 }
 
 export class PostgresTenantPolicyRepository implements TenantPolicyRepository {
   private readonly pool: pg.Pool;
+  private readonly retryAttempts: number;
+  private readonly retryDelayMs: number;
 
-  constructor(connectionString = config.databaseUrl) {
+  constructor(connectionString = config.databaseUrl, options: PostgresTenantPolicyRepositoryOptions = {}) {
     this.pool = new Pool({
       connectionString,
       max: config.pgPoolMax,
       idleTimeoutMillis: config.pgIdleTimeoutMs,
       connectionTimeoutMillis: config.pgConnectionTimeoutMs,
+      statement_timeout: config.pgQueryTimeoutMs,
+      query_timeout: config.pgQueryTimeoutMs,
+      idle_in_transaction_session_timeout: config.pgQueryTimeoutMs * 2,
       ssl: config.pgSsl ? { rejectUnauthorized: config.pgSslRejectUnauthorized } : false
     });
+    this.retryAttempts = options.retryAttempts ?? config.dependencyRetryAttempts;
+    this.retryDelayMs = options.retryDelayMs ?? config.dependencyRetryDelayMs;
   }
 
   async ping(): Promise<void> {
-    await this.pool.query("SELECT 1");
+    await retryDependency(
+      async () => {
+        await this.pool.query("SELECT 1");
+      },
+      this.retryOptions("Postgres health check")
+    );
   }
 
   async patchPolicy(tenantId: string, settings: Partial<SecurityPolicy>, actorSub: string): Promise<SecurityPolicy> {
-    const client = await this.pool.connect();
+    const client = await retryDependency(
+      () => this.pool.connect(),
+      this.retryOptions("Postgres connection acquisition")
+    );
 
     try {
       await client.query("BEGIN");
@@ -102,6 +124,14 @@ export class PostgresTenantPolicyRepository implements TenantPolicyRepository {
     } finally {
       client.release();
     }
+  }
+
+  private retryOptions(operationName: string) {
+    return {
+      attempts: this.retryAttempts,
+      delayMs: this.retryDelayMs,
+      operationName
+    };
   }
 }
 

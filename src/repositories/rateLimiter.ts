@@ -1,33 +1,57 @@
 import { Redis } from "@upstash/redis";
 import { config } from "../config/config.js";
+import { DependencyUnavailableError, retryDependency } from "../reliability/dependencies.js";
 
 export interface RateLimiter {
   enforce(actorId: string): Promise<void>;
+  ping(): Promise<void>;
 }
 
 export interface RedisCounterClient {
-  incr(key: string): Promise<number>;
-  expire(key: string, seconds: number): Promise<unknown>;
+  eval<TArgs extends unknown[], TData = unknown>(script: string, keys: string[], args: TArgs): Promise<TData>;
   set(key: string, value: string, options: { ex: number }): Promise<unknown>;
   get<TData = unknown>(key: string): Promise<TData | null>;
 }
 
+export interface UpstashRateLimiterOptions {
+  retryAttempts?: number;
+  retryDelayMs?: number;
+  operationTimeoutMs?: number;
+}
+
+const RATE_LIMIT_SCRIPT = `
+local count = redis.call("INCR", KEYS[1])
+if count == 1 then
+  redis.call("EXPIRE", KEYS[1], ARGV[1])
+end
+return count
+`;
+
 export class UpstashRateLimiter implements RateLimiter {
   private readonly redis: RedisCounterClient;
+  private readonly retryAttempts: number;
+  private readonly retryDelayMs: number;
+  private readonly operationTimeoutMs: number;
 
-  constructor(redis?: RedisCounterClient) {
+  constructor(redis?: RedisCounterClient, options: UpstashRateLimiterOptions = {}) {
     this.redis = redis ?? new Redis({
       url: config.upstashRedisRestUrl,
       token: config.upstashRedisRestToken
     });
+    this.retryAttempts = options.retryAttempts ?? config.dependencyRetryAttempts;
+    this.retryDelayMs = options.retryDelayMs ?? config.dependencyRetryDelayMs;
+    this.operationTimeoutMs = options.operationTimeoutMs ?? config.redisOperationTimeoutMs;
   }
 
   async enforce(actorId: string): Promise<void> {
     const key = `rate-limit:actor:${actorId}`;
-    const count = await this.redis.incr(key);
+    const count = await retryDependency(
+      () => this.redis.eval<[number], number>(RATE_LIMIT_SCRIPT, [key], [config.rateLimitWindowSeconds]),
+      this.retryOptions("Redis rate limit enforcement")
+    );
 
-    if (count === 1) {
-      await this.redis.expire(key, config.rateLimitWindowSeconds);
+    if (!Number.isFinite(count)) {
+      throw new DependencyUnavailableError("Redis rate limit enforcement returned an invalid counter value.");
     }
 
     if (count > config.rateLimitMaxRequests) {
@@ -37,10 +61,24 @@ export class UpstashRateLimiter implements RateLimiter {
 
   async ping(): Promise<void> {
     const key = "health:rate-limiter";
-    await this.redis.set(key, "ok", { ex: 30 });
-    const value = await this.redis.get<string>(key);
-    if (value !== "ok") {
-      throw new Error("Redis health check failed.");
-    }
+    await retryDependency(
+      async () => {
+        await this.redis.set(key, "ok", { ex: 30 });
+        const value = await this.redis.get<string>(key);
+        if (value !== "ok") {
+          throw new Error("Redis health check failed.");
+        }
+      },
+      this.retryOptions("Redis health check")
+    );
+  }
+
+  private retryOptions(operationName: string) {
+    return {
+      attempts: this.retryAttempts,
+      delayMs: this.retryDelayMs,
+      timeoutMs: this.operationTimeoutMs,
+      operationName
+    };
   }
 }

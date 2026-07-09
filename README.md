@@ -10,11 +10,12 @@ The current server is shaped like a deployable service rather than a stdio-only 
 - Per-session MCP transport lifecycle keyed by `mcp-session-id`.
 - Health endpoint at `/healthz`.
 - Readiness endpoint at `/readyz` for PostgreSQL and Redis dependency checks.
+- Bounded dependency timeouts/retries for health checks, Redis rate limiting, and PostgreSQL connection acquisition.
 - Structured JSON logging with Pino.
 - Request IDs via `x-request-id`.
 - Graceful shutdown on `SIGINT` and `SIGTERM`.
 
-JWT verification is handled with `jose` against a configured OIDC issuer, audience, and JWKS URI. Tenant policy storage uses PostgreSQL, and rate limiting uses Upstash Redis. MCP session state is still process-local and should be handled with deployment-level session affinity before using this for real control-plane operations.
+JWT verification is handled with `jose` against a configured OIDC issuer, audience, and JWKS URI with a bounded JWKS fetch timeout. Tenant policy storage uses PostgreSQL, and rate limiting uses Upstash Redis. MCP session state is process-local in this implementation; production deployments must use `SESSION_STATE_MODE=sticky` with load-balancer session affinity. `SESSION_STATE_MODE=external` fails startup until shared MCP transport coordination is implemented.
 
 ## Requirements
 
@@ -52,6 +53,7 @@ The server loads `.env` automatically through `dotenv`. In production, define th
 Environment variables:
 
 ```bash
+NODE_ENV=development # set to production in deployed environments
 PORT=3000          # HTTP listen port
 HOST=0.0.0.0       # HTTP listen host
 LOG_LEVEL=info     # Pino log level
@@ -59,10 +61,20 @@ SESSION_STATE_MODE=sticky
 OIDC_ISSUER=https://issuer.example.com/
 OIDC_AUDIENCE=https://identity-control-plane.example
 OIDC_JWKS_URI=https://issuer.example.com/.well-known/jwks.json
+OIDC_JWKS_TIMEOUT_MS=2000
 MCP_RESOURCE_SERVER_URL=http://localhost:3000/mcp
 MCP_ACCESS_SCOPES=mcp:readonly,mcp:readwrite
 DATABASE_URL=postgresql://user:password@host/dbname?sslmode=verify-full
 PG_POOL_MAX=10
+PG_IDLE_TIMEOUT_MS=30000
+PG_CONNECTION_TIMEOUT_MS=5000
+PG_QUERY_TIMEOUT_MS=2000
+PGSSL=require
+PGSSL_REJECT_UNAUTHORIZED=true
+DEPENDENCY_RETRY_ATTEMPTS=2
+DEPENDENCY_RETRY_DELAY_MS=100
+DEPENDENCY_TIMEOUT_MS=2000
+REDIS_OPERATION_TIMEOUT_MS=2000
 UPSTASH_REDIS_REST_URL=https://example.upstash.io
 UPSTASH_REDIS_REST_TOKEN=...
 RATE_LIMIT_WINDOW_SECONDS=60
@@ -70,6 +82,8 @@ RATE_LIMIT_MAX_REQUESTS=50
 ```
 
 `OIDC_ISSUER`, `OIDC_AUDIENCE`, `OIDC_JWKS_URI`, `DATABASE_URL`, `UPSTASH_REDIS_REST_URL`, and `UPSTASH_REDIS_REST_TOKEN` are required. The process fails during startup if any of them are missing.
+
+When `NODE_ENV=production`, config validation also requires an explicit HTTPS `MCP_RESOURCE_SERVER_URL`, HTTPS OIDC issuer/JWKS URLs, PostgreSQL TLS enabled with certificate verification, and HTTPS Upstash Redis REST access.
 
 For Auth0, these OIDC values must match the access token exactly:
 
@@ -198,9 +212,9 @@ Use a client that supports the MCP Streamable HTTP transport and point it at:
 http://localhost:3000/mcp
 ```
 
-In production, put the service behind your normal ingress, TLS termination, authentication middleware, and routing controls, then configure the client with the deployed HTTPS URL. If the service runs with more than one replica, use sticky sessions or move MCP session coordination to infrastructure that can preserve session affinity.
+In production, put the service behind your normal ingress, TLS termination, authentication middleware, and routing controls, then configure the client with the deployed HTTPS URL. If the service runs with more than one replica, use sticky sessions for `/mcp` traffic. The process rejects `SESSION_STATE_MODE=external` because the current MCP SDK transport keeps active transport state in memory.
 
-`SESSION_STATE_MODE=sticky` documents the current process-local MCP session map. Multiple replicas require load-balancer session affinity for `/mcp`. Use `SESSION_STATE_MODE=external` only after implementing shared MCP session coordination.
+`SESSION_STATE_MODE=sticky` documents and enforces the current process-local MCP session map. Multiple replicas require load-balancer session affinity for `/mcp`. Use `SESSION_STATE_MODE=external` only after implementing shared MCP session coordination.
 
 ## Curl Examples
 
@@ -273,6 +287,8 @@ Updates selected security policy settings for a target tenant after authenticati
 
 ### Input
 
+`targetTenant` must use the `tenant:<id>` form. The `<id>` portion may contain letters, numbers, underscores, hyphens, and dots.
+
 ```json
 {
   "targetTenant": "tenant:company_alpha",
@@ -291,9 +307,9 @@ Updates selected security policy settings for a target tenant after authenticati
 4. `jose` validates issuer, audience, expiry, and standard JWT validity constraints.
 5. Scopes are extracted from `scope`, `scopes`, or `scp`.
 6. `/mcp` requires one configured MCP access scope, such as `mcp:readonly` or `mcp:readwrite`.
-7. `SecurityEngine.enforceRateLimit` applies a Redis-backed per-subject rate limit.
-8. The write tool authorization policy requires `mcp:readwrite` and `policy:write`.
-9. If the token contains `tenant_id`, it must match `targetTenant`.
+7. The write tool authorization policy requires `mcp:readwrite` and `policy:write`.
+8. If the token contains `tenant_id`, it must match `targetTenant`.
+9. A Redis-backed per-subject rate limit is enforced before the write. Redis failures fail closed after bounded retries.
 10. The PostgreSQL tenant policy row is updated and an audit event is written in the same transaction.
 
 ### Successful Response
@@ -313,6 +329,7 @@ Updates selected security policy settings for a target tenant after authenticati
 
 ```text
 src/
+  app.ts                       Express app, MCP routes, readiness, dependency injection
   index.ts                     Express HTTP MCP server entry point
   auth/
     authorization.ts           Reusable tool authorization policies
@@ -331,6 +348,8 @@ src/
   repositories/
     rateLimiter.ts             Redis-backed actor rate limiting
     tenantPolicyRepository.ts  PostgreSQL policy storage and audit writes
+  reliability/
+    dependencies.ts            Shared retry and timeout helpers
   tools/
     toolResult.ts              Shared MCP tool response helpers
     identity/
@@ -342,6 +361,7 @@ src/
     types.ts                   Shared identity and policy types
 tests/
   auth/
+  http/
   repositories/
 migrations/
   001_tenant_policy_storage.sql
@@ -376,6 +396,9 @@ Before using this pattern for real control-plane operations:
 - Put the HTTP service behind TLS and ingress-level authentication controls.
 - Add CORS and host/origin validation appropriate for your deployment.
 - Use sticky sessions or an architecture that preserves MCP session affinity across replicas.
+- Keep `SESSION_STATE_MODE=sticky` until shared MCP transport coordination is implemented.
+- Set `NODE_ENV=production` so config validation rejects local HTTP metadata URLs and insecure PostgreSQL TLS settings.
+- Tune `DEPENDENCY_*`, `PG_QUERY_TIMEOUT_MS`, and `REDIS_OPERATION_TIMEOUT_MS` for your deployment latency budget.
 - Add managed database backups, migration automation, and connection pool sizing for your deployment.
 - Decide whether MCP session state should remain sticky-session based or move to shared coordination.
 - Add metrics and tracing.

@@ -7,7 +7,9 @@ import { UpstashRateLimiter } from "../repositories/rateLimiter.js";
 import { config } from "../config/config.js";
 import { extractScopes, extractTenantId } from "./claims.js";
 
-const jwks = createRemoteJWKSet(new URL(config.oidcJwksUri));
+const jwks = createRemoteJWKSet(new URL(config.oidcJwksUri), {
+  timeoutDuration: config.oidcJwksTimeoutMs
+});
 const rateLimiter = new UpstashRateLimiter();
 
 export class SecurityEngine {
